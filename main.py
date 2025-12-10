@@ -1,10 +1,9 @@
 import asyncio
 import sys
 
-# --- CORREÇÃO CRÍTICA PARA WINDOWS ---
+# --- CORREÇÃO PARA WINDOWS ---
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-# -------------------------------------
 
 import streamlit as st
 from playwright.sync_api import sync_playwright
@@ -12,162 +11,193 @@ import pandas as pd
 import time
 import random
 
-# --- CONFIGURAÇÃO DA UI ---
-st.set_page_config(page_title="G-Maps Hunter v3.0", page_icon="🎯", layout="wide")
+# --- CONFIGURAÇÃO DA INTERFACE ---
+st.set_page_config(page_title="G-Maps Hunter v3.4 (Final)", page_icon="🎯", layout="wide")
 
-st.title("🎯 G-Maps Hunter v3.0 (Deep Dive)")
-st.markdown("**Extração Completa:** Nome + Link + 📞 Telefone + 🌐 Site + ⭐ Nota")
+st.title("🎯 G-Maps Hunter v3.4 (Versão Final)")
+st.markdown("**Status:** Operacional | Filtro de Texto Livre | Persistência Ativa")
+
+# --- INICIALIZAÇÃO DA MEMÓRIA ---
+if 'dados_extraidos' not in st.session_state:
+    st.session_state['dados_extraidos'] = None
 
 with st.sidebar:
-    st.header("⚙️ Configurações da Missão")
+    st.header("⚙️ Configurações")
     termo_busca = st.text_input("Alvo:", placeholder="Ex: Pizzaria em Centro, BH")
-    qtd_scrolls = st.slider("Profundidade (Scrolls)", 1, 20, 5)
-    botao_iniciar = st.button("🚀 Iniciar Mineração", type="primary")
-
-# --- MOTOR DE INTELIGÊNCIA ---
-def extrair_detalhes(page):
-    """Função auxiliar que tenta achar os dados dentro da página de detalhes"""
-    dados = {"Telefone": "N/A", "Site": "N/A", "Nota": "N/A"}
     
+    # --- FILTRO DE PRECISÃO (TEXTO LIVRE) ---
+    st.divider()
+    st.markdown("🕵️ **Filtro de Qualidade**")
+    filtro_local = st.text_input("Deve conter no endereço:", placeholder="Ex: RJ (ou nome da rua)", help="Deixe vazio para trazer tudo. O robô descartará qualquer lead que não tenha esse texto no endereço.")
+    
+    qtd_scrolls = st.slider("Profundidade (Scrolls)", 1, 20, 5)
+    
+    def limpar_memoria():
+        st.session_state['dados_extraidos'] = None
+        
+    botao_iniciar = st.button("🚀 Iniciar Mineração", type="primary", on_click=limpar_memoria)
+
+# --- MOTOR DE EXTRAÇÃO ---
+def extrair_detalhes(page):
+    """Extrai telefone, site, nota e ENDEREÇO."""
+    dados = {"Telefone": "N/A", "Site": "N/A", "Nota": "N/A", "Endereco": "N/A"}
     try:
-        # 1. Extrai Telefone (Procura botão que começa com 'phone:')
-        # O seletor procura um botão que tenha o atributo data-item-id começando com phone
+        # 1. Telefone
         try:
             btn_phone = page.locator("button[data-item-id^='phone:']").first
             if btn_phone.count() > 0:
-                # O texto do botão geralmente é o número. Às vezes tem rótulo, então pegamos o aria-label
-                dados["Telefone"] = btn_phone.get_attribute("aria-label").replace("Ligar para: ", "").strip()
+                raw = btn_phone.get_attribute("aria-label")
+                if raw:
+                    dados["Telefone"] = raw.replace("Ligar para: ", "").replace("Ligar para ", "").strip()
         except: pass
 
-        # 2. Extrai Site (Procura botão que começa com 'authority')
+        # 2. Site
         try:
             btn_site = page.locator("a[data-item-id='authority']").first
             if btn_site.count() > 0:
                 dados["Site"] = btn_site.get_attribute("href")
         except: pass
 
-        # 3. Extrai Nota (Geralmente num span com aria-label de estrelas)
+        # 3. Nota
         try:
-            # Tenta pegar o número grande (ex: 4,8)
-            nota_element = page.locator("div[role='img']").get_attribute("aria-label") 
-            # Às vezes o Maps muda, vamos tentar um seletor genérico de texto de review
-            if not nota_element:
-                 ele = page.locator("span.fontBodyMedium > span").first
-                 if ele.count() > 0:
-                     dados["Nota"] = ele.inner_text()
+            nota_el = page.locator("div[role='img'][aria-label*='estrelas']").first
+            if nota_el.count() > 0:
+                dados["Nota"] = nota_el.get_attribute("aria-label").split(" ")[0]
             else:
-                dados["Nota"] = nota_element.split(" ")[0] # Pega só o "4,8"
+                span_nota = page.locator("span.fontBodyMedium > span").first
+                if span_nota.count() > 0:
+                    dados["Nota"] = span_nota.inner_text()
         except: pass
 
-    except Exception as e:
-        print(f"Erro ao extrair detalhes: {e}")
-    
+        # 4. Endereço (Essencial para o filtro)
+        try:
+            btn_end = page.locator("button[data-item-id='address']").first
+            if btn_end.count() > 0:
+                raw_end = btn_end.get_attribute("aria-label")
+                if raw_end:
+                    dados["Endereco"] = raw_end.replace("Endereço: ", "").strip()
+        except: pass
+
+    except: pass
     return dados
 
-def rodar_robo(termo, scrolls):
-    # Área de Status Dinâmico
-    status_main = st.status("🔧 Inicializando Robô...", expanded=True)
-    lista_preliminar = []
+def rodar_robo(termo, scrolls, filtro_obrigatorio):
+    status_main = st.status(f"🔧 Inicializando Robô... (Filtro: {filtro_obrigatorio if filtro_obrigatorio else 'Nenhum'})", expanded=True)
     lista_final = []
 
     with sync_playwright() as p:
-        # Inicia Navegador
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context()
+        browser = p.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled", "--start-maximized", "--no-sandbox"]
+        )
+        context = browser.new_context(locale="pt-BR")
         page = context.new_page()
 
-        # --- FASE 1: ARRASTÃO (Coleta de Links) ---
-        status_main.write(f"🌍 Fase 1: Mapeando terreno para '{termo}'...")
-        page.goto("https://www.google.com/maps", timeout=60000)
+        status_main.write(f"🌍 Acessando Google Maps...")
+        page.goto("https://www.google.com.br/maps?hl=pt-BR", timeout=60000)
         
-        # Busca
-        page.wait_for_selector("input#searchboxinput")
-        page.fill("input#searchboxinput", termo)
-        page.keyboard.press("Enter")
-        
-        # Espera carregar feed
+        try:
+            status_main.write(f"🔍 Buscando por: {termo}")
+            page.wait_for_selector("input#searchboxinput", timeout=15000)
+            page.fill("input#searchboxinput", termo)
+            page.keyboard.press("Enter")
+        except:
+            status_main.error("❌ Erro: Caixa de busca não encontrada.")
+            browser.close()
+            return pd.DataFrame()
+
         status_main.write("⏳ Aguardando resultados...")
-        page.wait_for_selector("div[role='feed']", timeout=15000)
-        
-        # Scroll Infinito
+        try:
+            page.wait_for_selector("div[role='feed']", timeout=15000)
+        except:
+            status_main.warning("⚠️ Demora no carregamento...")
+
         for i in range(scrolls):
             page.hover("div[role='feed']")
             page.mouse.wheel(0, 3000)
-            time.sleep(random.uniform(2, 3))
+            time.sleep(3)
             status_main.write(f"   📜 Scroll {i+1}/{scrolls}...")
+
+        status_main.write("👀 Listando candidatos...")
+        elementos = page.locator("div[role='feed'] a[href*='/maps/place']").all()
         
-        # Coleta os Links Básicos
-        status_main.write("👀 Listando alvos...")
-        elementos = page.locator("div[role='feed'] > div > div > a").all()
-        
+        links_unicos = set()
+        lista_preliminar = []
         for el in elementos:
             link = el.get_attribute("href")
             nome = el.get_attribute("aria-label")
-            if nome and link and "google.com" not in nome:
+            if link and nome and link not in links_unicos:
+                links_unicos.add(link)
                 lista_preliminar.append({"Empresa": nome, "Link": link})
         
         total_leads = len(lista_preliminar)
-        status_main.write(f"✅ Fase 1 Concluída: {total_leads} leads potenciais identificados.")
-        
-        # --- FASE 2: ENRIQUECIMENTO (Deep Dive) ---
-        status_main.write(f"🕵️‍♂️ Fase 2: Extraindo dados de contato (Isso pode demorar)...")
-        
-        progress_bar = status_main.progress(0)
-        
-        for i, item in enumerate(lista_preliminar):
-            # Navega direto para o link da empresa
-            try:
-                page.goto(item["Link"], timeout=30000)
-                page.wait_for_load_state("domcontentloaded") # Espera carregar um pouco
-                
-                # Extrai os dados novos
-                detalhes = extrair_detalhes(page)
-                
-                # Junta tudo
-                item_completo = {
-                    "Empresa": item["Empresa"],
-                    "Telefone": detalhes["Telefone"],
-                    "Site": detalhes["Site"],
-                    "Nota": detalhes["Nota"],
-                    "Link Maps": item["Link"]
-                }
-                lista_final.append(item_completo)
-                
-                # Feedback Visual
-                status_main.write(f"   📞 {item['Empresa']} -> {detalhes['Telefone']}")
-                
-                # Atualiza barra
+        status_main.write(f"✅ Fase 1: {total_leads} locais encontrados. Iniciando filtragem...")
+
+        if total_leads > 0:
+            progress_bar = status_main.progress(0)
+            leads_validos = 0
+            
+            for i, item in enumerate(lista_preliminar):
+                try:
+                    page.goto(item["Link"], timeout=30000)
+                    page.wait_for_selector("h1", timeout=5000)
+                    detalhes = extrair_detalhes(page)
+                    
+                    # --- LÓGICA DO FIREWALL ---
+                    passou_no_filtro = True
+                    motivo_filtro = ""
+                    
+                    if filtro_obrigatorio:
+                        # Verifica se o texto do filtro está contido no endereço (case insensitive)
+                        if filtro_obrigatorio.lower() not in detalhes["Endereco"].lower():
+                            passou_no_filtro = False
+                            motivo_filtro = "(Filtro de Localização)"
+                    
+                    if passou_no_filtro:
+                        item_completo = {
+                            "Empresa": item["Empresa"],
+                            "Telefone": detalhes["Telefone"],
+                            "Site": detalhes["Site"],
+                            "Nota": detalhes["Nota"],
+                            "Endereco": detalhes["Endereco"],
+                            "Link Maps": item["Link"]
+                        }
+                        lista_final.append(item_completo)
+                        leads_validos += 1
+                        
+                        tel_display = detalhes['Telefone'] if detalhes['Telefone'] != "N/A" else "---"
+                        status_main.write(f"   ✅ {item['Empresa'][:20]}... | 📞 {tel_display}")
+                    else:
+                        status_main.write(f"   🗑️ {item['Empresa'][:20]}... removido {motivo_filtro}")
+
+                except: pass
                 progress_bar.progress((i + 1) / total_leads)
-                
-            except Exception as e:
-                status_main.write(f"   ❌ Falha ao acessar {item['Empresa']}")
         
         browser.close()
-        status_main.update(label="🎉 Mineração Completa!", state="complete", expanded=False)
+        status_main.update(label=f"🎉 Finalizado! {leads_validos} leads qualificados.", state="complete", expanded=False)
 
     return pd.DataFrame(lista_final)
 
-# --- EXECUÇÃO ---
+# --- FLUXO DE CONTROLE ---
 if botao_iniciar and termo_busca:
-    try:
-        df = rodar_robo(termo_busca, qtd_scrolls)
-        
-        # Métricas
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Leads Totais", len(df))
+    st.session_state['dados_extraidos'] = rodar_robo(termo_busca, qtd_scrolls, filtro_local)
+
+if st.session_state['dados_extraidos'] is not None:
+    df = st.session_state['dados_extraidos']
+    if not df.empty:
+        st.divider()
+        c1, c2 = st.columns(2)
+        c1.metric("Leads Filtrados", len(df))
         c2.metric("Com Telefone", len(df[df["Telefone"] != "N/A"]))
-        c3.metric("Com Site", len(df[df["Site"] != "N/A"]))
         
         st.dataframe(df, use_container_width=True)
         
-        # Exportação Otimizada
-        csv = df.to_csv(index=False, sep=';', encoding='utf-8-sig') # Ponto e vírgula para Excel BR
+        csv = df.to_csv(index=False, sep=';', encoding='utf-8-sig')
         st.download_button(
-            label="💰 Baixar Planilha Rica (CSV)",
+            label="📥 Baixar Dados Limpos (CSV)",
             data=csv,
-            file_name=f"leads_ricos_{termo_busca.replace(' ', '_')}.csv",
+            file_name=f"leads_gmaps_{termo_busca.replace(' ', '_')}.csv",
             mime="text/csv",
         )
-        
-    except Exception as e:
-        st.error(f"Erro Crítico: {e}")
+    else:
+        st.warning(f"Nenhum lead passou pelo filtro '{filtro_local}'. Tente deixar o filtro vazio.")
